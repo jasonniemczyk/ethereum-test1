@@ -51,11 +51,16 @@ aws cloudformation create-stack --template-body file://cf-templates/eth-miner.ya
     * `AwsRegion` - AWS regions to deploy the cluster in
     * `MaxHashrate`
     * `MinHashrate`
-* Create a stack:
+* Create the eth-miner stack:
 ```bash
 aws cloudformation create-stack --template-body file://cf-templates/eth-miner.yaml --capabilities CAPABILITY_IAM --stack-name <YOUR_ETH_MINER_STACK_NAME>
 ```
 * Check the stack's status in the AWS console. When completed, the miners will mine to the `EtherbaseAddress` address.
+* To adjust the hash rate, modify the values of `MaxHashrate` and `MinHashrate` parameters and update the eth-miner stack:
+```bash
+aws cloudformation update-stack --template-body file://cf-templates/eth-miner.yaml --capabilities CAPABILITY_IAM --stack-name <YOUR_ETH_MINER_STACK_NAME>
+```
+* The stack will automatically add or remove ec2 instances and docker containers to reach the required hash rate.
 * Remember to delete your test stacks when no longer needed:
 ```bash
 aws cloudformation delete-stack --stack-name <YOUR_ETH_MINER_STACK_NAME>
@@ -111,8 +116,9 @@ TODO
 * Work on geth syncing issues. Fast sync doesn't always work and it's still quite slow. A solution might be to schedule
 frequent dumps of the blockchain data files on S3 or an EBS volume and take snapshots. This part has given me the most 
 headache so far.
-* Fix the `CWPutETHMetricsCron` events rule - currently not working. Check 
-[cw-put-metric-data.sh](docker/geth-node/cw-put-metric-data.sh).
+* Add an indicator when geth is fully synchronized.
+* Fix the `CWPutETHMetricsCron` events rule - currently not working most likely because of insufficient permissions. 
+Check [cw-put-metric-data.sh](docker/geth-node/cw-put-metric-data.sh).
 * Add Grafana dashboard as an ECS service and expose it via an external application load balancer.
 * Add conditions to use SSL if `SSLCertificateArn` is not empty.
 * Error handling in scripts
