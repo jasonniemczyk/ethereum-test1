@@ -1,0 +1,403 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: ETH Miner Stack
+
+
+Parameters:
+  AwsRegion:
+    Description: AWS Region.
+    Type: String
+    Default: us-east-1
+  Environment:
+    Description: Environment
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - stg
+      - prd
+    ConstraintDescription: Can only be dev, stg, or prd
+  EthMinerMemoryReservation:
+    Type: Number
+    Description: Memory soft limit for ethminer. Set this high enough to fill one host completely.
+    Default: 2500
+  EthMinerSlaveMaxCapacity:
+    Type: Number
+    Description: Set this to 2 less than DockerInstanceMaxCount leaving space for GethNodeService and EthMinerLeaderService.
+    Default: 8
+  GethNodeVersion:
+      Type: String
+      Description: Docker build number of geth node
+      Default: latest
+  GethNodeStackName:
+    Type: String
+    Description: Geth node stack name to import exports from
+    Default: ''  # TODO: set this
+  MaxHashrate:
+    Type: Number
+    Description: Maximum acceptable hash rate. This value must be higher than MinHashrate.
+    Default: 100000
+  MinHashrate:
+    Type: Number
+    Description: Minimum acceptable hash rate. This value must be lower than MaxHashrate by at the least the hashrate of a single node. Set this lower if you want the cluster to scale in or higher if you want the cluster to scale out.
+    Default: 1  # Set this according to the instance type. c5.large can process ~70kH/s.
+    MinValue: 1
+  ProductName:
+    Type: String
+    Description: Product name - for tagging
+    Default: eth-miner
+  SSLCertificateArn:
+    Type: String
+    Description: The pre-existing cert ARN used to attach to the ALB listener for HTTPS connections
+    Default: ''
+
+
+Mappings:
+  AwsRegionNames:
+    us-east-1:
+      short: useast1
+      original: us-east-1
+    us-east-2:
+      short: useast2
+      original: us-east-2
+    us-west-1:
+      short: uswest1
+      original: us-west-1
+    us-west-2:
+      short: uswest2
+      original: us-west-2
+    ca-central-1:
+      short: cacentral1
+      original: ca-central-1
+    eu-central-1:
+      short: eucentral1
+      original: eu-central-1
+    eu-west-1:
+      short: euwest1
+      original: eu-west-1
+    eu-west-2:
+      short: euwest2
+      original: eu-west-2
+  IPs:  # VPC and subnet IP address ranges
+    InternalSubnets:
+      AZ1: 10.0.0.0/21
+      AZ2: 10.0.16.0/21
+      AZ3: 10.0.32.0/21
+    ExternalSubnets:
+      AZ1: 10.0.100.0/21
+      AZ2: 10.0.116.0/21
+      AZ3: 10.0.132.0/21
+    VPC:
+      CidrBlock: 10.0.0.0/16
+  Services:
+    GethNode:
+      ContainerPort: 8545
+      LoadBalancerListenerPort: 8545
+
+
+Conditions:
+  # Create Route53 records and use SSL when the certificate ARN is not empty.
+  SSLDisabled: !Equals
+    - !Ref 'SSLCertificateArn'
+    - ''
+  SSLEnabled: !Not
+    - !Equals
+      - !Ref 'SSLCertificateArn'
+      - ''
+
+
+Resources:
+  # Push geth metrics to CloudWatch
+  CWPutETHMetricsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - EntryPoint:
+            - /cw-put-metric-data.sh
+          Environment:
+            - Name: AwsRegion
+              Value: !Ref 'AWS::Region'
+            - Name: StackName
+              Value: !Ref 'AWS::StackName'
+            - Name: GETH_ENDPOINT
+              Value:
+                Fn::ImportValue:
+                  !Sub "${GethNodeStackName}-GethEndpoint"
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/geth-node:${GethNodeVersion}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::ImportValue:
+                  !Sub "${GethNodeStackName}-CloudWatchLogGroup"
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: CWPutETHMetrics
+          MemoryReservation: !Ref 'EthMinerMemoryReservation'
+          Name: cw-put-eth-metrics
+          PortMappings:
+            - HostPort: 0
+              ContainerPort: !FindInMap [Services, GethNode, ContainerPort]
+      Volumes:
+        - Name: 'ethereum'
+      TaskRoleArn:
+        Fn::ImportValue:
+          !Sub "${GethNodeStackName}-EthMinerRole"
+
+  CWPutETHMetricsCron:
+    Type: AWS::Events::Rule
+    DependsOn: CWPutETHMetricsTaskDefinition
+    Properties:
+      Description: Event rule to send ETH metrics to CloudWatch
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn:
+            Fn::ImportValue:
+              !Sub "${GethNodeStackName}-ECSClusterLinuxArn"
+          EcsParameters:
+            TaskDefinitionArn: !Ref 'CWPutETHMetricsTaskDefinition'
+            TaskCount: 1
+          Id: !Sub 'CWPutETHMetricsCron-${AWS::StackName}'
+          RoleArn:
+            Fn::ImportValue:
+              !Sub "${GethNodeStackName}-EthMinerRoleArn"
+
+  # Miners
+  EthMinerLeaderTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - EntryPoint:
+          - /start-eth-cpu-miner.sh
+          Environment:
+            - Name: LEADER
+              Value: 1
+            - Name: GETH_ENDPOINT
+              Value:
+                Fn::ImportValue:
+                  !Sub "${GethNodeStackName}-GethEndpoint"
+            - Name: AwsRegion
+              Value: !Ref 'AWS::Region'
+            - Name: StackName
+              Value: !Ref 'AWS::StackName'
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/eth-cpu-miner:latest'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::ImportValue:
+                  !Sub "${GethNodeStackName}-CloudWatchLogGroup"
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: EthMinerLeader
+          MemoryReservation: !Ref 'EthMinerMemoryReservation'
+          MountPoints:
+            -
+              ContainerPath: /root/.ethash
+              SourceVolume: ethash
+          Name: eth-miner-leader
+      Volumes:
+        -
+          Host:
+            SourcePath: '/mnt/efs/.ethash'
+          Name: 'ethash'
+      TaskRoleArn:
+        Fn::ImportValue:
+          !Sub "${GethNodeStackName}-EthMinerRole"
+
+  EthMinerLeaderService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster:
+        Fn::ImportValue:
+          !Sub "${GethNodeStackName}-ECSClusterLinux"
+      DesiredCount: 1  # Make sure the leader always runs to have the updated DAG files for faster scaling.
+      PlacementStrategies:
+        - Field: attribute:ecs.availability-zone
+          Type: spread
+        - Field: instanceId
+          Type: spread
+      TaskDefinition: !Ref 'EthMinerLeaderTaskDefinition'
+
+  EthMinerSlaveTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - EntryPoint:
+          - /start-eth-cpu-miner.sh
+          Environment:
+            - Name: LEADER
+              Value: 0
+            - Name: GETH_ENDPOINT
+              Value:
+                Fn::ImportValue:
+                  !Sub "${GethNodeStackName}-GethEndpoint"
+            - Name: AwsRegion
+              Value: !Ref 'AWS::Region'
+            - Name: StackName
+              Value: !Ref 'AWS::StackName'
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/eth-cpu-miner:latest'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group:
+                Fn::ImportValue:
+                  !Sub "${GethNodeStackName}-CloudWatchLogGroup"
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: EthMinerSlave
+          MemoryReservation: !Ref 'EthMinerMemoryReservation'
+          MountPoints:
+            -
+              ContainerPath: /root/.ethash
+              SourceVolume: ethash
+          Name: eth-miner-slave
+      Volumes:
+        -
+          Host:
+            SourcePath: '/mnt/efs/.ethash'
+          Name: 'ethash'
+      TaskRoleArn:
+        Fn::ImportValue:
+          !Sub "${GethNodeStackName}-EthMinerRole"
+
+  EthMinerSlaveService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - EthMinerLeaderService
+    Properties:
+      Cluster:
+        Fn::ImportValue:
+          !Sub "${GethNodeStackName}-ECSClusterLinux"
+      DesiredCount: 0
+      PlacementStrategies:
+        - Field: attribute:ecs.availability-zone
+          Type: spread
+        - Field: instanceId
+          Type: spread
+      TaskDefinition: !Ref 'EthMinerSlaveTaskDefinition'
+
+  # AutoScaling of Docker hosts and EthMinerSlaveService.
+  # We only need one miner to process DAG files, so EthMinerLeader always runs with 1 container and never scales.
+  DockerScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: PercentChangeInCapacity
+      AutoScalingGroupName:
+        Fn::ImportValue:
+          !Sub "${GethNodeStackName}-DockerScalingGroup"
+      Cooldown: 60
+      ScalingAdjustment: 200  # Be aggressive when scaling out.
+
+  DockerScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: PercentChangeInCapacity
+      AutoScalingGroupName:
+        Fn::ImportValue:
+          !Sub "${GethNodeStackName}-DockerScalingGroup"
+      Cooldown: 120  # Cooldown for 2 minutes to give enough time for new metrics to come in.
+      ScalingAdjustment: -10
+
+  DockerDownScaleDownAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: 'true'
+      AlarmActions:
+        - !Ref 'DockerScaleDownPolicy'
+      EvaluationPeriods: 10  # Give the cluster 5 minutes to stabilize during scaling. Too aggressive can lead to flipping alarms.
+      Statistic: Average
+      Threshold: 90  # If lower than 90% CPU, it means that at least one Docker host is idle in the cluster.
+      AlarmDescription: Low CPU utilization in ECS cluster
+      Period: 60
+      Namespace: AWS/EC2
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value:
+            Fn::ImportValue:
+              !Sub "${GethNodeStackName}-DockerScalingGroup"
+      ComparisonOperator: LessThanOrEqualToThreshold
+      MetricName: CPUUtilization
+
+  EthMinerSlaveServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: EthMinerSlaveService
+    Properties:
+      MaxCapacity: !Ref 'EthMinerSlaveMaxCapacity'
+      MinCapacity: 0
+      ResourceId:
+        Fn::Sub:
+          - 'service/${ECSClusterLinux}/${EthMinerSlaveService.Name}'
+          - ECSClusterLinux:
+              Fn::ImportValue:
+                !Sub "${GethNodeStackName}-ECSClusterLinux"
+            GETH_PORT: !FindInMap [Services, GethNode, ContainerPort]
+      RoleARN:
+        Fn::ImportValue:
+          !Sub "${GethNodeStackName}-ECSAutoscalingRoleArn"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  EthMinerSlaveServiceScalingUpPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: EthMinerSlaveServiceScalingUpPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref 'EthMinerSlaveServiceScalingTarget'
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity  # This must not be percentage when scaling out because of EthMinerSlaveServiceScalingTarget's MinCapacity of 0
+        Cooldown: 60
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalUpperBound: 0
+            ScalingAdjustment: 2
+
+  EthMinerSlaveServiceScalingDownPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: EthMinerSlaveServiceScalingDownPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref 'EthMinerSlaveServiceScalingTarget'
+      StepScalingPolicyConfiguration:
+        AdjustmentType: PercentChangeInCapacity
+        Cooldown: 120  # Cooldown for 2 minutes to give enough time for new metrics to come in.
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            ScalingAdjustment: -10
+
+  HashrateLowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: EthMinerLeaderService
+    Properties:
+      ActionsEnabled: 'true'
+      AlarmActions:
+        - !Ref 'DockerScaleUpPolicy'
+        - !Ref 'EthMinerSlaveServiceScalingUpPolicy'
+      AlarmDescription: hashrate too low
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: StackName
+          Value: !Ref 'AWS::StackName'
+      EvaluationPeriods: 1
+      MetricName: HashRate
+      Namespace: ethminer
+      Period: 60
+      Statistic: Average
+      Threshold: !Ref 'MinHashrate'
+
+  HashrateHighAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: 'true'
+      AlarmActions:
+        - !Ref 'DockerScaleDownPolicy'
+        - !Ref 'EthMinerSlaveServiceScalingDownPolicy'
+      AlarmDescription: hashrate too high
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StackName
+          Value: !Ref 'AWS::StackName'
+      EvaluationPeriods: 1
+      MetricName: HashRate
+      Namespace: ethminer
+      Period: 60
+      Statistic: Average
+      Threshold: !Ref 'MaxHashrate'

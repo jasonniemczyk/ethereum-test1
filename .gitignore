@@ -1,0 +1,6 @@
+*.py[cod]
+
+# editors
+*.orig
+*.swp
+.idea

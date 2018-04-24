@@ -1,0 +1,1004 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Geth Node Stack
+
+
+Parameters:
+  AwsRegion:
+    Description: AWS Region.
+    Type: String
+    Default: us-east-1
+  BastionInstanceType:
+    Type: String
+    Description: Instance type for the bastion server. When the value is not null, a bastion instance will be created.
+    Default: ''
+#    Default: 't2.nano'
+  DockerInstanceMaxCount:
+    Type: Number
+    Description: Maximum number of Docker host instances
+    Default: 10
+  DockerInstanceMinCount:
+    Type: Number
+    Description: Minimum number of Docker host instances
+    Default: 1
+    MinValue: 1  # Make sure at least one instance is always running
+  DockerInstanceType:
+    Type: String
+    Description: Instance type for the Docker host instances
+    Default: c5.large
+  Environment:
+    Description: Environment
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - stg
+      - prd
+    ConstraintDescription: Can only be dev, stg, or prd
+  EtherbaseAddress:
+    Type: String
+    Description: Address to mine ETH to
+    Default: ''  # TODO: Set this
+  EthMinerMemoryReservation:
+    Type: Number
+    Description: Memory soft limit for geth node.
+    Default: 1280
+  ForceInstanceReplacement:
+    Type: String
+    Description: A random string set in the launchconfig userdata. When updated, it will force instances to be replaced with new ones.
+    Default: ''
+  GethNodeVersion:
+      Type: String
+      Description: Docker build number of geth node
+      Default: latest
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to instances
+    Default: dummy  # TODO: Set this
+  ProductName:
+    Type: String
+    Description: Product name - for tagging
+    Default: eth-miner
+  SSHLocation:
+    Type: String
+    Description: IP address from which to permit SSH access to the bastion host
+    Default: 127.0.0.1/32  # Dummy localhost, TODO: Set this
+  SSLCertificateArn:
+    Type: String
+    Description: The pre-existing cert ARN used to attach to the ALB listener for HTTPS connections
+    Default: ''
+
+
+Mappings:
+  AmiList:  # TODO: Implement this in Lambda to always get the latest AMIs without having to manage this mapping.
+    BasionInstanceImageId:
+      description: "amazon/amzn-ami-hvm-2017.09.1.20180115-x86_64-gp2. Run `for region in {us-east-1,us-west-1,us-west-2,eu-west-1,eu-west-2,ap-northeast-1,ap-southeast-1}; do echo Region: $region && aws --region $region ec2 describe-images --filter Name='owner-alias',Values='amazon' --filter Name='name',Values='amzn-ami-hvm-*-x86_64-gp2' --query 'Images[*].{ImageId:ImageId,Name:Name}' --output text | grep `date +%Y`; done`"
+      useast1: ami-1853ac65
+      uswest1: ami-bf5540df
+      uswest2: ami-d874e0a0
+      euwest1: ami-3bfab942
+      euwest2: ami-dff017b8
+      apnortheast1: ami-a77c30c1
+      apsoutheast1: ami-e2adf99e
+    DockerInstanceImageId:
+      description: "amzn-ami-2017.09.k-amazon-ecs-optimized. Info at https://docs.aws.amazon.com/AmazonECS/latest/developerguide/ecs-optimized_AMI.html. Or run `aws ssm get-parameters --names /aws/service/ecs/optimized-ami/amazon-linux/recommended`"
+      useast1: ami-cb17d8b6
+      uswest1: ami-9cbbaffc
+      uswest2: ami-05b5277d
+      euwest1: ami-bfb5fec6
+      euwest2: ami-a48d6bc3
+      apnortheast1: ami-5add893c
+      apsoutheast1: ami-acbcefd0
+  AwsRegionNames:
+    us-east-1:
+      short: useast1
+      original: us-east-1
+    us-east-2:
+      short: useast2
+      original: us-east-2
+    us-west-1:
+      short: uswest1
+      original: us-west-1
+    us-west-2:
+      short: uswest2
+      original: us-west-2
+    ca-central-1:
+      short: cacentral1
+      original: ca-central-1
+    eu-central-1:
+      short: eucentral1
+      original: eu-central-1
+    eu-west-1:
+      short: euwest1
+      original: eu-west-1
+    eu-west-2:
+      short: euwest2
+      original: eu-west-2
+  IPs:  # VPC and subnet IP address ranges
+    InternalSubnets:
+      AZ1: 10.0.0.0/21
+      AZ2: 10.0.16.0/21
+      AZ3: 10.0.32.0/21
+    ExternalSubnets:
+      AZ1: 10.0.100.0/21
+      AZ2: 10.0.116.0/21
+      AZ3: 10.0.132.0/21
+    VPC:
+      CidrBlock: 10.0.0.0/16
+  Services:
+    GethNode:
+      ContainerPort: 8545
+      LoadBalancerListenerPort: 8545
+
+
+Conditions:
+  # Deploy bastion instance only if the instance type is set
+  BastionDeploy: !Not [!Equals [!Ref 'BastionInstanceType', '']]
+
+  # Create Route53 records and use SSL when the certificate ARN is not empty.
+  SSLDisabled: !Equals
+    - !Ref 'SSLCertificateArn'
+    - ''
+  SSLEnabled: !Not
+    - !Equals
+      - !Ref 'SSLCertificateArn'
+      - ''
+
+
+Resources:
+  # VPC related resources
+  VPC:
+    Type: AWS::EC2::VPC
+    DependsOn: InternetGateway
+    Properties:
+      CidrBlock: !FindInMap [IPs, VPC, CidrBlock]
+      EnableDnsSupport: 'true'
+      EnableDnsHostnames: 'true'
+      Tags:
+        - Key: Environment
+          Value: !Ref 'Environment'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPC'
+        - Key: ProductName
+          Value: !Ref 'ProductName'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: !Ref 'Environment'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-InternetGateway'
+        - Key: ProductName
+          Value: !Ref 'ProductName'
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    DependsOn: InternetGateway
+    Properties:
+      VpcId: !Ref 'VPC'
+      InternetGatewayId: !Ref 'InternetGateway'
+
+  InternetRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+
+  InternetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref 'InternetRouteTable'
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref 'InternetGateway'
+
+  # External Subnets and routes
+  ExternalSubnetAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        !Select
+          - 0  # Automatically select an AZ from index 0
+          - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !FindInMap [ IPs, ExternalSubnets, AZ1 ]
+      MapPublicIpOnLaunch: 'true'
+      VpcId: !Ref 'VPC'
+  ExternalSubnetRouteTableAssociationAZ1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref 'ExternalSubnetAZ1'
+      RouteTableId: !Ref 'InternetRouteTable'
+
+  ExternalSubnetAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        !Select
+          - 1  # Automatically select an AZ from index 1
+          - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !FindInMap [ IPs, ExternalSubnets, AZ2 ]
+      MapPublicIpOnLaunch: 'true'
+      VpcId: !Ref 'VPC'
+  ExternalSubnetRouteTableAssociationAZ2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref 'ExternalSubnetAZ2'
+      RouteTableId: !Ref 'InternetRouteTable'
+
+  ExternalSubnetAZ3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        !Select
+          - 2  # Automatically select an AZ from index 1
+          - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !FindInMap [ IPs, ExternalSubnets, AZ3 ]
+      MapPublicIpOnLaunch: 'true'
+      VpcId: !Ref 'VPC'
+  ExternalSubnetRouteTableAssociationAZ3:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref 'ExternalSubnetAZ3'
+      RouteTableId: !Ref 'InternetRouteTable'
+
+  # NAT Gateway resources
+  NATEIPAZ1:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  NATGatewayAZ1:
+    DependsOn: AttachGateway
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt 'NATEIPAZ1.AllocationId'
+      SubnetId: !Ref 'ExternalSubnetAZ1'
+      Tags:
+        - Key: Environment
+          Value: !Ref 'Environment'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-NATGateway-AZ1'
+        - Key: ProductName
+          Value: !Ref 'ProductName'
+  NATRouteTableAZ1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+  NATRouteAZ1:
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId: !Ref 'NATRouteTableAZ1'
+        DestinationCidrBlock: 0.0.0.0/0
+        NatGatewayId: !Ref 'NATGatewayAZ1'
+
+  NATEIPAZ2:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  NATGatewayAZ2:
+    DependsOn: AttachGateway
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt 'NATEIPAZ2.AllocationId'
+      SubnetId: !Ref 'ExternalSubnetAZ2'
+      Tags:
+        - Key: Environment
+          Value: !Ref 'Environment'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-NATGateway-AZ2'
+        - Key: ProductName
+          Value: !Ref 'ProductName'
+  NATRouteTableAZ2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+  NATRouteAZ2:
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId: !Ref 'NATRouteTableAZ2'
+        DestinationCidrBlock: 0.0.0.0/0
+        NatGatewayId: !Ref 'NATGatewayAZ2'
+
+  NATEIPAZ3:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  NATGatewayAZ3:
+    DependsOn: AttachGateway
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt 'NATEIPAZ3.AllocationId'
+      SubnetId: !Ref 'ExternalSubnetAZ3'
+      Tags:
+        - Key: Environment
+          Value: !Ref 'Environment'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-NATGateway-AZ3'
+        - Key: ProductName
+          Value: !Ref 'ProductName'
+  NATRouteTableAZ3:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+  NATRouteAZ3:
+      Type: AWS::EC2::Route
+      Properties:
+        RouteTableId: !Ref 'NATRouteTableAZ3'
+        DestinationCidrBlock: 0.0.0.0/0
+        NatGatewayId: !Ref 'NATGatewayAZ3'
+
+  # Internal Subnets and routes
+  InternalSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        !Select
+          - 0  # Automatically select an AZ from index 0
+          - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !FindInMap [ IPs, InternalSubnets, AZ1 ]
+      VpcId: !Ref 'VPC'
+  InternalSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref 'InternalSubnet1'
+      RouteTableId: !Ref 'NATRouteTableAZ1'
+
+  InternalSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        !Select
+          - 1  # Automatically select an AZ from index 1
+          - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !FindInMap [ IPs, InternalSubnets, AZ2 ]
+      VpcId: !Ref 'VPC'
+  InternalSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref 'InternalSubnet2'
+      RouteTableId: !Ref 'NATRouteTableAZ2'
+
+  InternalSubnet3:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        !Select
+          - 2  # Automatically select an AZ from index 2
+          - Fn::GetAZs: !Ref 'AWS::Region'
+      CidrBlock: !FindInMap [ IPs, InternalSubnets, AZ3 ]
+      VpcId: !Ref 'VPC'
+  InternalSubnet3RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref 'InternalSubnet3'
+      RouteTableId: !Ref 'NATRouteTableAZ3'
+
+  # Bastion host related resources
+  BastionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: BastionDeploy
+    Properties:
+      GroupDescription: Security group for bastion instance
+      VpcId: !Ref 'VPC'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref 'SSHLocation'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 0.0.0.0/0
+  BastionInstance:
+    Type: AWS::EC2::Instance
+    Condition: BastionDeploy
+    Properties:
+      ImageId: !FindInMap [AmiList, BasionInstanceImageId, !FindInMap [AwsRegionNames, !Ref 'AWS::Region', short]]
+      InstanceType: !Ref 'BastionInstanceType'
+      KeyName: !Ref 'KeyName'
+      SecurityGroupIds:
+        - !Ref 'BastionSecurityGroup'
+      SubnetId: !Ref 'ExternalSubnetAZ1'
+      Tags:
+        - Key: Environment
+          Value: !Ref 'Environment'
+        - Key: Name
+          Value: !Sub '${ProductName}-${Environment}-${AWS::StackName}-BastionInstance'
+        - Key: ProductName
+          Value: !Ref 'ProductName'
+
+  # Elastic File System - for blockchain and DAG files
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref 'VPC'
+      GroupDescription: Security group for EFS mount targets
+      SecurityGroupIngress:
+#        - IpProtocol: tcp
+#          FromPort: '2049'
+#          ToPort: '2049'
+#          SourceSecurityGroupName: !Ref 'DockerSecurityGroup' # TODO: Check why this is not working
+        - CidrIp: !FindInMap [ IPs, InternalSubnets, AZ1 ]
+          IpProtocol: tcp
+          FromPort: '2049'
+          ToPort: '2049'
+        - CidrIp: !FindInMap [ IPs, InternalSubnets, AZ2 ]
+          IpProtocol: tcp
+          FromPort: '2049'
+          ToPort: '2049'
+        - CidrIp: !FindInMap [ IPs, InternalSubnets, AZ3 ]
+          IpProtocol: tcp
+          FromPort: '2049'
+          ToPort: '2049'
+
+  EFS:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      FileSystemTags:
+        - Key: Environment
+          Value: !Ref 'Environment'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EFS'
+        - Key: ProductName
+          Value: !Ref 'ProductName'
+
+  EFSMountTargetAZ1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref 'EFS'
+      SubnetId: !Ref 'InternalSubnet1'
+      SecurityGroups:
+        - !Ref 'EFSSecurityGroup'
+
+  EFSMountTargetAZ2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref 'EFS'
+      SubnetId: !Ref 'InternalSubnet2'
+      SecurityGroups:
+        - !Ref 'EFSSecurityGroup'
+
+  EFSMountTargetAZ3:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref 'EFS'
+      SubnetId: !Ref 'InternalSubnet3'
+      SecurityGroups:
+        - !Ref 'EFSSecurityGroup'
+
+  # Internal ALB network resources
+  InternalALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    DependsOn: DockerSecurityGroup
+    Properties:
+      GroupDescription: Internal ALB Security Group
+      VpcId: !Ref 'VPC'
+      SecurityGroupIngress:
+#        - IpProtocol: tcp
+#          FromPort: !FindInMap [Services, GethNode, ContainerPort]
+#          ToPort: !FindInMap [Services, GethNode, ContainerPort]
+#          SourceSecurityGroupId: !Ref 'DockerSecurityGroup'  # TODO: Check why this is not working
+        - CidrIp: !FindInMap [ IPs, InternalSubnets, AZ1 ]
+          IpProtocol: tcp
+          FromPort: !FindInMap [Services, GethNode, ContainerPort]
+          ToPort: !FindInMap [Services, GethNode, ContainerPort]
+        - CidrIp: !FindInMap [ IPs, InternalSubnets, AZ2 ]
+          IpProtocol: tcp
+          FromPort: !FindInMap [Services, GethNode, ContainerPort]
+          ToPort: !FindInMap [Services, GethNode, ContainerPort]
+        - CidrIp: !FindInMap [ IPs, InternalSubnets, AZ3 ]
+          IpProtocol: tcp
+          FromPort: !FindInMap [Services, GethNode, ContainerPort]
+          ToPort: !FindInMap [Services, GethNode, ContainerPort]
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 0.0.0.0/0
+
+  InternalALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      SecurityGroups:
+        - !Ref 'InternalALBSecurityGroup'
+      Subnets:
+        - !Ref 'InternalSubnet1'
+        - !Ref 'InternalSubnet2'
+        - !Ref 'InternalSubnet3'
+      Tags:
+        - Key: Environment
+          Value: !Ref 'Environment'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-InternalALB'
+        - Key: ProductName
+          Value: !Ref 'ProductName'
+
+  # CloudWatch group for OS and application logs
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '${ProductName}-${Environment}-${AWS::StackName}-Logs'
+      RetentionInDays: 30
+
+  # Resources related to Docker hosts and EC2 scaling
+  ECSClusterLinux:
+    Type: AWS::ECS::Cluster
+
+  DockerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Docker Hosts Security Group
+      VpcId: !Ref 'VPC'
+      # All ports within VPC because of dynamic port assignment on Docker hosts in bridge network mode. Can restrict in the awsvpc mode.
+      SecurityGroupIngress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: !GetAtt 'VPC.CidrBlock'
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          FromPort: '-1'
+          ToPort: '-1'
+          CidrIp: 0.0.0.0/0
+
+  DockerInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: docker-instance
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:SetInstanceHealth
+                  - autoscaling:SetInstanceProtection
+                  - elasticloadbalancing:Describe*
+                  - elasticloadbalancing:Deregister*
+                  - elasticloadbalancing:Register*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecs:DeregisterContainerInstance
+                  - ecs:DiscoverPollEndpoint
+                  - ecs:Poll
+                  - ecs:RegisterContainerInstance
+                  - ecs:StartTelemetrySession
+                  - ecs:Submit*
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:Describe*
+                  - cloudwatch:PutMetricData
+                  - ec2:DescribeTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                - ecr:BatchCheckLayerAvailability
+                - ecr:BatchGetImage
+                - ecr:GetDownloadUrlForLayer
+                - ecr:GetAuthorizationToken
+                Resource:
+                - '*'
+
+  DockerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref 'DockerInstanceRole'
+
+  DockerLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    DependsOn:
+      - EFS
+    Metadata:
+      AWS::CloudFormation::Authentication:
+        S3AccessCreds:
+          type: S3
+          roleName: !Ref 'DockerInstanceRole'
+      Comment1: Comment DockerLaunchConfig
+    Properties:
+      SpotPrice: 0.05  # Reasonable for c5.large. On-demand price is 0.096 in us-east-1.
+      IamInstanceProfile: !Ref 'DockerInstanceProfile'
+      SecurityGroups:
+        - !Ref 'DockerSecurityGroup'
+      ImageId: !FindInMap [AmiList, DockerInstanceImageId, !FindInMap [
+                           AwsRegionNames, !Ref 'AWS::Region', short]]
+      InstanceType: !Ref 'DockerInstanceType'
+      KeyName: !Ref 'KeyName'
+      UserData: !Base64
+        Fn::Sub: |
+          #!/bin/bash -xe
+          # To make sure instances are replaced, just add a timestamp below:
+          # Update Timestamp: ${ForceInstanceReplacement}
+          # Wait for Internet routing
+          while [[ ! `curl http://repo.${AWS::Region}.amazonaws.com/latest/main/mirror.list` =~ ^.+packages.+$ ]];do
+            sleep 5
+          done
+          # Install CloudWatch Logs agent
+          yum install -y awslogs
+          # Configure logs
+          rm /etc/awslogs/awslogs.conf
+          cat <<EOF >/etc/awslogs/awslogs.conf
+          [general]
+          state_file = /var/lib/awslogs/agent-state
+
+          [/var/log/messages]
+          datetime_format = %b %d %H:%M:%S
+          file = /var/log/messages
+          buffer_duration = 5000
+          log_stream_name = /var/log/messages/{instance_id}
+          initial_position = start_of_file
+          log_group_name = ${CloudWatchLogGroup}
+
+          [/var/log/cloud-init.log]
+          file = /var/log/cloud-init.log
+          buffer_duration = 5000
+          log_stream_name = /var/log/cloud-init.log/{instance_id}
+          initial_position = start_of_file
+          log_group_name = ${CloudWatchLogGroup}
+
+          [/var/log/cloud-init-output.log]
+          file = /var/log/cloud-init-output.log
+          buffer_duration = 5000
+          log_stream_name = /var/log/cloud-init-output.log/{instance_id}
+          initial_position = start_of_file
+          log_group_name = ${CloudWatchLogGroup}
+
+          EOF
+
+          # Start CloudWatch Logs agent
+          service awslogs start
+          chkconfig awslogs on
+
+          # Install CFN helpers
+          yum install -y aws-cfn-bootstrap
+          # Install EFS mount helper
+          yum install -y amazon-efs-utils
+          # Mount EFS volumes with TLS encryption.
+          if [ ! -d /mnt/efs ]
+          then
+              mkdir -p /mnt/efs
+              echo -e '${EFS}.efs.${AWS::Region}.amazonaws.com:/ /mnt/efs nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 0 0' >> /etc/fstab;
+          fi
+          mount -a
+
+          # for DAG files used by miners
+          if [ ! -d /mnt/efs/.ethash ]
+          then
+              mkdir -p /mnt/efs/.ethash
+          fi
+          # for blockchain data used by geth
+          if [ ! -d /mnt/efs/.ethereum ]
+          then
+              mkdir -p /mnt/efs/.ethereum
+          fi
+
+          # Register with ECS cluster
+          echo "ECS_CLUSTER=${ECSClusterLinux}" >> /etc/ecs/ecs.config
+
+          # Send signal to cfn stack
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource DockerScalingGroup --region ${AWS::Region}
+
+  DockerScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - NATRouteAZ1
+      - NATRouteAZ2
+      - NATRouteAZ3
+      - EFSMountTargetAZ1
+      - EFSMountTargetAZ2
+      - EFSMountTargetAZ3
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT20M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: !Ref 'DockerInstanceMaxCount'
+        MinInstancesInService: !Ref 'DockerInstanceMinCount'
+        PauseTime: PT1M
+      AutoScalingScheduledAction:
+        IgnoreUnmodifiedGroupSizeProperties: true
+      AutoScalingReplacingUpdate:
+        WillReplace: 'true'
+    Properties:
+      LaunchConfigurationName: !Ref 'DockerLaunchConfig'
+      MinSize: !Ref 'DockerInstanceMinCount'
+      MaxSize: !Ref 'DockerInstanceMaxCount'
+      DesiredCapacity: !Ref 'DockerInstanceMinCount'
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics:
+            - GroupMinSize
+            - GroupMaxSize
+            - GroupDesiredCapacity
+            - GroupInServiceInstances
+            - GroupPendingInstances
+            - GroupStandbyInstances
+            - GroupTerminatingInstances
+            - GroupTotalInstances
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProductName}-${Environment}-${AWS::StackName}-Docker'
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref 'Environment'
+          PropagateAtLaunch: true
+        - Key: ProductName
+          Value: !Ref 'ProductName'
+          PropagateAtLaunch: true
+      VPCZoneIdentifier:
+        - !Ref 'InternalSubnet1'
+        - !Ref 'InternalSubnet2'
+        - !Ref 'InternalSubnet3'
+
+  ECSAutoscalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - application-autoscaling.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: service-autoscaling
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - application-autoscaling:*
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:PutMetricAlarm
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: '*'
+
+  # ECS services
+  ECSServiceRolePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ECSServiceRolePolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:Describe*
+              - ec2:AuthorizeSecurityGroupIngress
+              - autoscaling:DescribeAutoScalingGroups
+              - autoscaling:SetDesiredCapacity
+              - autoscaling:SetInstanceHealth
+              - autoscaling:SetInstanceProtection
+              - elasticloadbalancing:Describe*
+              - elasticloadbalancing:Deregister*
+              - elasticloadbalancing:Register*
+              - cloudwatch:PutMetricData
+              - ecs:RunTask
+            Resource: '*'
+      Roles:
+        - !Ref 'EthMinerRole'
+
+  EthMinerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs.amazonaws.com
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: EthMiner
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:SetDesiredCapacity
+                  - autoscaling:SetInstanceHealth
+                  - autoscaling:SetInstanceProtection
+                  - elasticloadbalancing:Describe*
+                  - elasticloadbalancing:Deregister*
+                  - elasticloadbalancing:Register*
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:Describe*
+                Resource: '*'
+
+  # Geth
+  GethNodeTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - EthMinerRole
+    Properties:
+      ContainerDefinitions:
+        - Command:
+#          - '--syncmode'
+#          - 'fast'
+          - '--testnet'
+          - '--rpc'
+          - '--rpcaddr'
+          - '0.0.0.0'
+          - '--rpcvhosts'
+          - '*'
+          - '--etherbase'
+          - !Ref 'EtherbaseAddress'
+          EntryPoint:
+            - geth
+          Environment:
+            - Name: AwsRegion
+              Value: !Ref 'AWS::Region'
+            - Name: StackName
+              Value: !Ref 'AWS::StackName'
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/geth-node:${GethNodeVersion}'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref 'CloudWatchLogGroup'
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: GethNode
+          MemoryReservation: !Ref 'EthMinerMemoryReservation'
+          MountPoints:
+            -
+              ContainerPath: /root/.ethereum
+              SourceVolume: ethereum
+          Name: geth-node
+          PortMappings:
+            - HostPort: 0
+              ContainerPort: !FindInMap [Services, GethNode, ContainerPort]
+      Volumes:
+        -
+          Host:
+            SourcePath: '/mnt/efs/.ethereum'
+          Name: 'ethereum'
+      TaskRoleArn: !Ref 'EthMinerRole'
+
+  GethNodeService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - DockerScalingGroup
+      - EthMinerRole
+      - ECSServiceRolePolicy
+      - InternalALB
+      - GethInternalListener
+    Properties:
+      Cluster: !Ref 'ECSClusterLinux'
+      DesiredCount: 1  # Make sure the geth node always runs.  # TODO: deal with ~/.ethereum during rolling updates (EFS mount)
+      HealthCheckGracePeriodSeconds: 600
+      LoadBalancers:
+        - ContainerName: geth-node
+          ContainerPort: !FindInMap [Services, GethNode, ContainerPort]
+          TargetGroupArn: !Ref 'GethInternalTargetGroup'
+      PlacementStrategies:
+        - Field: attribute:ecs.availability-zone
+          Type: spread
+        - Field: instanceId
+          Type: spread
+      TaskDefinition: !Ref 'GethNodeTaskDefinition'
+
+  GethInternalListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'GethInternalTargetGroup'
+          Type: forward
+      LoadBalancerArn: !Ref 'InternalALB'
+      Port: !FindInMap [Services, GethNode, ContainerPort]
+      Protocol: HTTP
+
+  GethInternalTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      Matcher:
+        HttpCode: '200'
+      Port: '80'
+      Protocol: HTTP
+      Tags:
+        - Key: Environment
+          Value: !Ref 'Environment'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-GethInternalTargetGroup'
+        - Key: ProductName
+          Value: !Ref 'ProductName'
+#      TargetGroupAttributes:
+#        - Key: deregistration_delay.timeout_seconds
+#          Value: '5'
+#        - Key: stickiness.enabled
+#          Value: 'true'
+#        - Key: stickiness.type
+#          Value: lb_cookie
+      UnhealthyThresholdCount: 10
+      VpcId: !Ref 'VPC'
+
+
+Outputs:
+  BastionAddress:
+    Value: !GetAtt 'BastionInstance.PublicIp'
+    Condition: BastionDeploy
+    Description: IP address of the bastion instance.
+  CloudWatchLogGroup:
+    Value: !Ref 'CloudWatchLogGroup'
+    Description: CloudWatch Logs Group Name
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-CloudWatchLogGroup
+  CloudWatchLogGroupURL:
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logStream:group=${CloudWatchLogGroup}'
+    Description: Filtered link to CloudWatch logs
+  DockerScalingGroup:
+    Value: !Ref 'DockerScalingGroup'
+    Description: Docker scaling group
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-DockerScalingGroup
+  ECSClusterLinux:
+    Value: !Ref 'ECSClusterLinux'
+    Description: Linux ECS cluster name
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-ECSClusterLinux
+  ECSClusterLinuxArn:
+    Value: !GetAtt 'ECSClusterLinux.Arn'
+    Description: Linux ECS cluster ARN
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-ECSClusterLinuxArn
+  ECSAutoscalingRoleArn:
+    Value: !GetAtt 'ECSAutoscalingRole.Arn'
+    Description: ECS Autoscaling IAM role ARN
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-ECSAutoscalingRoleArn
+  EthMinerRole:
+    Value: !Ref 'EthMinerRole'
+    Description: Eth Miner IAM role
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-EthMinerRole
+  EthMinerRoleArn:
+    Value: !GetAtt 'EthMinerRole.Arn'
+    Description: Eth Miner IAM role ARN
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-EthMinerRoleArn
+  GethEndpoint:
+    Value:
+      Fn::Sub:
+        - 'http://${GETH_ENDPOINT}:${GETH_PORT}'
+        - GETH_ENDPOINT:
+            !GetAtt 'InternalALB.DNSName'
+          GETH_PORT: !FindInMap [Services, GethNode, ContainerPort]
+    Description: Geth node endpoint
+    Export:
+      Name:
+        Fn::Sub: ${AWS::StackName}-GethEndpoint
